@@ -18,6 +18,8 @@ mod linux {
 }
 
 // Explicit imports for clarity
+use bitflags::bitflags;
+use kernel::{prelude::*, usb, input};
 use linux::input::{ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y};
 use linux::stat::{S_IRUGO, S_IWUSR};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,10 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const XPAD_PKT_LEN: usize = 64;
 const GHL_GUITAR_POKE_INTERVAL: u64 = 8; // Seconds
 
-bitflags::bitflags! {
     /// Configuration flags for controller mapping
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct MapFlags: u8 {
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug)]
+    struct MapFlags: u8 {
         const DPAD_TO_BUTTONS    = 1 << 0;
         const TRIGGERS_TO_BUTTONS = 1 << 1;
         const STICKS_TO_NULL     = 1 << 2;
@@ -37,6 +39,36 @@ bitflags::bitflags! {
         const PADDLES           = 1 << 4;
         const PROFILE_BUTTON     = 1 << 5;
     }
+}
+
+// Existing `XType` enum can be updated or replaced with your provided code
+#[derive(Debug, Clone, Copy)]
+enum XType {
+    Xbox,
+    Xbox360,
+    Xbox360W,
+    XboxOne,
+    Unknown,
+}
+
+// Existing `PacketType` enum can be updated or replaced with your provided code
+#[repr(u8)]
+enum PacketType {
+    Xb = 0,
+    Xbe1 = 1,
+    Xbe2FwOld = 2,
+    Xbe2Fw5Early = 3,
+    Xbe2Fw5_11 = 4,
+}
+
+// Existing `XpadDevice` struct can be updated or replaced with your provided code
+struct XpadDevice {
+    id_vendor: u16,
+    id_product: u16,
+    name: &'static str,
+    mapping: MapFlags,
+    xtype: XType,
+    quirks: QuirkFlags,
 }
 
 /// Common configuration preset for dance pads
@@ -87,6 +119,14 @@ pub const QUIRK_360_START: QuirkFlags = QuirkFlags::START_PKT_1
 
 // Module parameters
 static DPAD_TO_BUTTONS: AtomicBool = AtomicBool::new(false);
+
+module_param!(
+    dpad_to_buttons,
+    DPAD_TO_BUTTONS,
+    bool,
+    0o644,
+    "Map D-Pad to buttons instead of axes"
+);
 static TRIGGERS_TO_BUTTONS: AtomicBool = AtomicBool::new(false);
 static STICKS_TO_NULL: AtomicBool = AtomicBool::new(false);
 static AUTO_POWEROFF: AtomicBool = AtomicBool::new(false);
@@ -103,9 +143,9 @@ struct XpadDevice {
 }
 
 // Device list using properly defined types
-use phf::{phf_ordered_map, OrderedMap};
+use phf::{phf_map, Map};
 
-static XPAD_DEVICES: OrderedMap<(u16, u16), XpadDevice> = phf_ordered_map! {
+static XPAD_DEVICES: Map<(u16, u16), XpadDevice> = phf_map! {
     (0x0079, 0x18d4) => XpadDevice {
         id_vendor: 0x0079,
         id_product: 0x18d4,
@@ -2694,25 +2734,38 @@ fn process_packet(dev: &mut InputDev, cmd: u16, data: &[u8]) -> Result<(), kerne
  */
 use std::rc::Rc;
 
-struct UsbXpad {
-    pad_present: bool,
-    x360w_dev: Option<Rc<input_dev>>,
+struct XpadDriver {
+    udev: usb::Device,
+    interface: usb::Interface,
+    input_dev: input::Device,
+    pad_present: AtomicBool,
 }
 
-impl UsbXpad {
-    fn process_packet(&mut self, cmd: u16, data: &[u8]) {
-        if data[0] & 0x08 != 0 {
-            let present = data[1] & 0x80 != 0;
-            if self.pad_present != present {
-                self.pad_present = present;
-                self.schedule_work();
-            }
-        } else if data[1] == 0x1 {
-            let x360w_dev = Rc::new(input_dev);
-            if let Some(ref mut dev) = self.x360w_dev {
-                xpad360_process_packet(self, dev, cmd, &data[4]);
-            }
-        }
+impl usb::Driver for XpadDriver {
+    fn probe(
+        udev: &usb::Device,
+        interface: &usb::Interface,
+        id_info: &usb::IdInfo,
+    ) -> Result<Self> {
+        let input_dev = input::Device::new()?;
+        
+        // Setup input device capabilities based on controller type
+        input_dev.set_evbit(input::EventType::Key)?;
+        input_dev.set_evbit(input::EventType::Abs)?;
+        
+        // Register device
+        input_dev.register("xpad")?;
+
+        Ok(Self {
+            udev: udev.clone(),
+            interface: interface.clone(),
+            input_dev,
+            pad_present: AtomicBool::new(false),
+        })
+    }
+
+    fn disconnected(&self) {
+        self.input_dev.unregister();
     }
 }
 
@@ -2832,6 +2885,43 @@ fn xpadone_process_packet(xpad: &UsbXpad, data: &[u8]) {
     }
 }
 
+impl XpadDriver {
+    fn process_packet(&self, data: &[u8]) {
+        let dev = &self.input_dev;
+        
+        // Common button processing
+        dev.report_key(input::Key::ButtonSouth, data[4] & 0x10 != 0);
+        dev.report_key(input::Key::ButtonEast, data[4] & 0x20 != 0);
+        
+        // Analog stick handling
+        if !self.mapping.contains(MapFlags::STICKS_TO_NULL) {
+            let x = i16::from_le_bytes([data[12], data[13]]);
+            dev.report_abs(input::AbsoluteAxis::X, x.into());
+        }
+        
+        dev.synchronize();
+    }
+}
+
+impl XpadDriver {
+    fn setup_urbs(&self) -> Result<()> {
+        let mut urb_in = usb::Urb::new_interrupt(
+            &self.udev,
+            self.interface.cur_altsetting().endpoint_in(0)?,
+            64,
+        )?;
+        
+        urb_in.set_completion(|urb| {
+            let driver = urb.context::<XpadDriver>();
+            driver.process_packet(urb.data());
+            urb.submit().unwrap();
+        });
+        
+        urb_in.submit()?;
+        Ok(())
+    }
+}
+
 // URB completion handler
 fn xpad_irq_in(urb: &Urb, xpad: Arc<UsbXpad>) -> Result<(), UsbError> {
     match urb.status() {
@@ -2890,32 +2980,23 @@ fn xpad_try_sending_next_out_packet(xpad: &UsbXpad) -> Result<(), UsbError> {
 }
 
 // Force feedback implementation
-fn xpad_play_effect(xpad: &UsbXpad, strong: u16, weak: u16) -> Result<(), UsbError> {
-    let mut packet = Vec::with_capacity(13);
-    
-    match xpad.xtype {
-        XType::XboxOne => {
-            packet.extend_from_slice(&[
-                GIP_CMD_RUMBLE,
-                0x00,
-                xpad.odata_serial.fetch_add(1, Ordering::SeqCst) as u8,
-                GIP_PL_LEN(9),
-                0x00,
-                GIP_MOTOR_ALL,
-                0x00,
-                0x00,
-                (strong / 512) as u8,
-                (weak / 512) as u8,
-                0xFF,
-                0x00,
-                0xFF,
-            ]);
-        },
-        // Other controller types...
-        _ => return Err(UsbError::NotSupported),
+impl input::ForceFeedback for XpadDriver {
+    fn upload_effect(&self, effect: input::Effect) -> Result<()> {
+        let mut packet = Vec::new();
+        
+        match self.xtype {
+            XType::XboxOne => {
+                packet.extend(&[
+                    0x09, 0x00, 0x00,
+                    (effect.strong / 256) as u8,
+                    (effect.weak / 256) as u8,
+                ]);
+            },
+            _ => return Err(Error::ENOTSUPP),
+        }
+        
+        self.send_output_packet(&packet)
     }
-
-    xpad.send_output_packet(&packet)
 }
 
 // LED control
@@ -2932,4 +3013,494 @@ impl LedDevice for XpadLed {
         };
         self.xpad.send_output_packet(&packet)
     }
+}
+
+// Define the command types for setting LEDs on the Xbox 360/Wireless Controller
+enum LedCommand {
+    Off = 0,
+    BlinkAllThenPrevious,
+    TopLeftBlinkThenOn,
+    TopRightBlinkThenOn,
+    BottomLeftBlinkThenOn,
+    BottomRightBlinkThenOn,
+    TopLeftOn,
+    TopRightOn,
+    BottomLeftOn,
+    BottomRightOn,
+    Rotate,
+    BlinkBasedOnPrevious,
+    SlowBlinkBasedOnPrevious,
+    RotateWithTwoLights,
+    PersistentSlowAllBlink,
+    BlinkOnceThenPrevious,
+}
+
+struct Xpad {
+    out_packets: Vec<OutputPacket>,
+    odata_lock: std::sync::Mutex<()>,
+    xtype: XType,
+}
+
+struct OutputPacket {
+    data: [u8; 12], // Assuming a fixed size for simplicity
+    len: usize,
+    pending: bool,
+}
+
+enum XType {
+    Xbox360,
+    Xbox360W,
+}
+
+fn xpad_send_led_command(xpad: &mut Xpad, command: LedCommand) {
+    let packet = &mut xpad.out_packets[XPAD_OUT_LED_IDX];
+    let mut flags;
+
+    // Adjust the command to fit within 0-15 range
+    let command = (command as u8 % 16);
+
+    // Acquire lock and handle different types of controllers
+    std::sync::Mutex::lock(&xpad.odata_lock).unwrap();
+
+    match xpad.xtype {
+        XType::Xbox360 => {
+            packet.data[0] = 0x01;
+            packet.data[1] = 0x03;
+            packet.data[2] = command as u8;
+            packet.len = 3;
+            packet.pending = true;
+        },
+        XType::Xbox360W => {
+            packet.data[0] = 0x00;
+            packet.data[1] = 0x00;
+            packet.data[2] = 0x08;
+            packet.data[3] = 0x40 + command as u8;
+            packet.data[4] = 0x00;
+            packet.data[5] = 0x00;
+            packet.data[6] = 0x00;
+            packet.data[7] = 0x00;
+            packet.data[8] = 0x00;
+            packet.data[9] = 0x00;
+            packet.data[10] = 0x00;
+            packet.data[11] = 0x00;
+            packet.len = 12;
+            packet.pending = true;
+        }
+    }
+
+    // Attempt to send the next output packet
+    xpad_try_sending_next_out_packet(xpad);
+
+    // Release lock
+    std::sync::Mutex::unlock(&xpad.odata_lock).unwrap();
+}
+
+use kernel::{prelude::*, usb, input, led, sync::{Arc, Mutex, SpinLock}, c_str, str::CStr, device::Device, error::Result, workqueue::Work};
+
+// LED handling
+struct XpadLed {
+    led: led::LedClass,
+    xpad: Arc<XpadDriver>,
+    pad_nr: i32,
+}
+
+impl XpadLed {
+    fn new(xpad: Arc<XpadDriver>) -> Result<Self> {
+        let mut led = led::LedClass::try_new(c_str!("xpad"), xpad.device())?;
+        led.set_brightness_set(Self::brightness_set);
+        Ok(Self { led, xpad, pad_nr: 0 })
+    }
+
+    fn brightness_set(led: &led::LedClass, value: u8) {
+        let xpad_led = container_of!(led, Self, led);
+        xpad_led.xpad.send_led_command(value);
+    }
+
+    fn identify(&self) {
+        self.led.set_brightness((self.pad_nr % 4 + 2) as u8);
+    }
+}
+
+// Main driver structure
+struct XpadDriver {
+    udev: usb::Device,
+    interface: usb::Interface,
+    input: input::Device,
+    led: Option<XpadLed>,
+    pad_nr: i32,
+    urb_in: usb::Urb,
+    urb_out: Option<usb::Urb>,
+    work: Work,
+    poweroff_work: DelayedWork,
+    quirks: QuirkFlags,
+    xtype: XType,
+    mapping: MapFlags,
+    packet_type: PacketType,
+}
+
+impl XpadDriver {
+    // Probe function
+    fn probe(udev: &usb::Device, interface: &usb::Interface) -> Result<Arc<Self>> {
+        let mut driver = Arc::try_new(Self {
+            udev: udev.clone(),
+            interface: interface.clone(),
+            input: input::Device::new()?,
+            led: None,
+            pad_nr: -1,
+            urb_in: usb::Urb::new_interrupt(udev, interface.endpoint_in(0)?, XPAD_PKT_LEN as u32)?,
+            urb_out: None,
+            work: Work::new(),
+            poweroff_work: DelayedWork::new(),
+            quirks: QuirkFlags::empty(),
+            xtype: XType::Unknown,
+            mapping: MapFlags::empty(),
+            packet_type: PacketType::Xb,
+        })?;
+
+        // Initialize device type
+        driver.detect_controller_type()?;
+
+        // Setup input device
+        driver.setup_input()?;
+
+        // Initialize LED if needed
+        if driver.xtype == XType::Xbox360 || driver.xtype == XType::Xbox360W {
+            driver.led = Some(XpadLed::new(driver.clone())?);
+            driver.led.as_ref().unwrap().identify();
+        }
+
+        // Setup URBs
+        driver.setup_urbs()?;
+
+        Ok(driver)
+    }
+
+    // Input device setup
+    fn setup_input(&mut self) -> Result<()> {
+        self.input.set_name(c_str!("Xbox Controller"))?;
+        self.setup_capabilities()?;
+        self.input.register()?;
+        Ok(())
+    }
+
+    // URB handling
+    fn setup_urbs(&mut self) -> Result<()> {
+        let driver = self.clone();
+        self.urb_in.set_completion(move |urb| {
+            if let Ok(data) = urb.data() {
+                driver.process_packet(data);
+            }
+            let _ = urb.submit();
+        });
+        self.urb_in.submit()?;
+        Ok(())
+    }
+
+    // Controller type detection
+    fn detect_controller_type(&mut self) -> Result<()> {
+        let desc = self.interface.cur_altsetting().desc();
+        if desc.bInterfaceClass == usb::CLASS_VENDOR_SPEC {
+            match desc.bInterfaceProtocol {
+                129 => self.xtype = XType::Xbox360W,
+                208 => self.xtype = XType::XboxOne,
+                _ => self.xtype = XType::Xbox360,
+            }
+        } else {
+            self.xtype = XType::Xbox;
+        }
+        Ok(())
+    }
+
+    // LED command sending
+    fn send_led_command(&self, value: u8) {
+        let mut data = [0u8; 3];
+        data[0] = 0x01;
+        data[1] = 0x03;
+        data[2] = value;
+        let _ = self.send_control(&data);
+    }
+
+    // Control transfer helper
+    fn send_control(&self, data: &[u8]) -> Result<()> {
+        let mut urb = usb::Urb::new_control(&self.udev, usb::Direction::Out, data.len() as u32)?;
+        urb.setup(|setup| {
+            setup.request_type = usb::ControlRequestType::VENDOR;
+            setup.request = 0x01;
+            setup.value = 0x100;
+            setup.index = 0x00;
+            setup.length = data.len() as u16;
+        })?;
+        urb.transfer(data)?;
+        urb.submit()
+    }
+
+    // Start/stop input
+    fn start_input(&self) -> Result<()> {
+        if self.xtype == XType::Xbox360 {
+            self.xbox360_start()?;
+        }
+        self.urb_in.submit()?;
+        Ok(())
+    }
+
+    fn stop_input(&self) {
+        self.urb_in.kill();
+    }
+
+    // Xbox 360 specific initialization
+    fn xbox360_start(&self) -> Result<()> {
+        let mut dummy = [0u8; 20];
+        let _ = self.send_control(&dummy);
+        Ok(())
+    }
+
+    // Power management
+    fn poweroff_controller(&self) {
+        let data = SpinLock::new([0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let _ = self.send_control(&*data.lock());
+    }
+}
+
+// Workqueue handlers
+impl Work for XpadDriver {
+    fn run(&self) {
+        self.poweroff_controller();
+    }
+}
+
+// USB driver registration
+struct XpadDriverRegistration;
+
+impl usb::DriverRegistration for XpadDriverRegistration {
+    fn name(&self) -> &'static CStr {
+        c_str!("xpad")
+    }
+
+    fn probe(&self, udev: &usb::Device, intf: &usb::Interface) -> Result<Arc<dyn usb::Driver>> {
+        XpadDriver::probe(udev, intf).map(|d| d as Arc<dyn usb::Driver>)
+    }
+}
+
+module_usb_driver! {
+    registration: XpadDriverRegistration,
+    params: [
+        ("dpad_to_buttons", DPAD_TO_BUTTONS),
+        ("triggers_to_buttons", TRIGGERS_TO_BUTTONS),
+        ("sticks_to_null", STICKS_TO_NULL),
+    ],
+}
+
+use kernel::{prelude::*, usb, input, sync::{Arc, Mutex, SpinLock}, error::Result, device::Device, workqueue::Work, timer::Timer};
+
+// Constants
+const GIP_WIRED_INTF_DATA: u8 = 0;
+const XPAD_PKT_LEN: usize = 64;
+const GHL_GUITAR_POKE_INTERVAL: u64 = 8; // Seconds
+
+// Main driver structure
+struct XpadDriver {
+    udev: usb::Device,
+    interface: usb::Interface,
+    input: input::Device,
+    irq_in: usb::Urb,
+    irq_out: Option<usb::Urb>,
+    ghl_urb: Option<usb::Urb>,
+    ghl_poke_timer: Timer,
+    quirks: QuirkFlags,
+    xtype: XType,
+    mapping: MapFlags,
+    packet_type: PacketType,
+    pad_present: bool,
+    idata: Vec<u8>,
+    idata_dma: usize,
+    work: Work,
+    poweroff_work: DelayedWork,
+}
+
+impl XpadDriver {
+    // Probe function
+    fn probe(udev: &usb::Device, intf: &usb::Interface) -> Result<Arc<Self>> {
+        let desc = intf.cur_altsetting().desc();
+
+        // Check for Xbox One controller interface
+        if desc.xtype == XType::XboxOne && desc.bInterfaceNumber != GIP_WIRED_INTF_DATA {
+            return Err(Error::ENODEV);
+        }
+
+        // Find interrupt endpoints
+        let (ep_irq_in, ep_irq_out) = Self::find_interrupt_endpoints(intf)?;
+
+        // Allocate driver structure
+        let mut driver = Arc::try_new(Self {
+            udev: udev.clone(),
+            interface: intf.clone(),
+            input: input::Device::new()?,
+            irq_in: usb::Urb::new_interrupt(udev, ep_irq_in, XPAD_PKT_LEN as u32)?,
+            irq_out: None,
+            ghl_urb: None,
+            ghl_poke_timer: Timer::new(),
+            quirks: QuirkFlags::empty(),
+            xtype: XType::Unknown,
+            mapping: MapFlags::empty(),
+            packet_type: PacketType::Xb,
+            pad_present: false,
+            idata: Vec::with_capacity(XPAD_PKT_LEN),
+            idata_dma: 0,
+            work: Work::new(),
+            poweroff_work: DelayedWork::new(),
+        })?;
+
+        // Initialize output
+        driver.init_output(ep_irq_out)?;
+
+        // Setup interrupt URB
+        driver.setup_interrupt_urb(ep_irq_in)?;
+
+        // Detect packet type for Microsoft controllers
+        if udev.vendor_id() == 0x045e {
+            driver.detect_packet_type(udev)?;
+        }
+
+        // Initialize based on controller type
+        match driver.xtype {
+            XType::Xbox360W => {
+                driver.xbox360w_start_input()?;
+                udev.set_quirks(usb::Quirks::RESET_RESUME);
+            }
+            _ => {
+                driver.init_input()?;
+            }
+        }
+
+        // Initialize GHL guitar hero controller if needed
+        if driver.quirks.contains(QuirkFlags::GHL_XBOXONE) {
+            driver.init_ghl_controller(udev, ep_irq_out)?;
+        }
+
+        Ok(driver)
+    }
+
+    // Find interrupt endpoints
+    fn find_interrupt_endpoints(intf: &usb::Interface) -> Result<(usb::Endpoint, usb::Endpoint)> {
+        let mut ep_irq_in = None;
+        let mut ep_irq_out = None;
+
+        for ep in intf.cur_altsetting().endpoints() {
+            if ep.transfer_type() == usb::TransferType::Interrupt {
+                if ep.direction() == usb::Direction::In {
+                    ep_irq_in = Some(ep);
+                } else {
+                    ep_irq_out = Some(ep);
+                }
+            }
+        }
+
+        match (ep_irq_in, ep_irq_out) {
+            (Some(in_ep), Some(out_ep)) => Ok((in_ep, out_ep)),
+            _ => Err(Error::ENODEV),
+        }
+    }
+
+    // Setup interrupt URB
+    fn setup_interrupt_urb(&mut self, ep: usb::Endpoint) -> Result<()> {
+        let driver = self.clone();
+        self.irq_in.set_completion(move |urb| {
+            if let Ok(data) = urb.data() {
+                driver.process_packet(data);
+            }
+            let _ = urb.submit();
+        });
+
+        self.irq_in.set_pipe(usb::rcvintpipe(&self.udev, ep.address()));
+        self.irq_in.set_buffer(&self.idata);
+        self.irq_in.set_interval(ep.interval());
+        self.irq_in.set_transfer_flags(usb::TransferFlags::NO_TRANSFER_DMA_MAP);
+        self.irq_in.set_transfer_dma(self.idata_dma);
+
+        self.irq_in.submit()
+    }
+
+    // Detect packet type for Microsoft controllers
+    fn detect_packet_type(&mut self, udev: &usb::Device) -> Result<()> {
+        match udev.product_id() {
+            0x02e3 => self.packet_type = PacketType::Xbe1,
+            0x0b00 => {
+                let bcd_device = udev.device_version();
+                if bcd_device < 0x0500 {
+                    self.packet_type = PacketType::Xbe2FwOld;
+                } else if bcd_device < 0x050b {
+                    self.packet_type = PacketType::Xbe2Fw5Early;
+                } else {
+                    self.packet_type = PacketType::Xbe2Fw5_11;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    // Initialize GHL guitar hero controller
+    fn init_ghl_controller(&mut self, udev: &usb::Device, ep: usb::Endpoint) -> Result<()> {
+        self.ghl_urb = Some(usb::Urb::new_interrupt(udev, ep, XPAD_PKT_LEN as u32)?);
+        self.ghl_poke_timer.setup(Self::ghl_magic_poke);
+        self.ghl_poke_timer.modify(GHL_GUITAR_POKE_INTERVAL * HZ);
+        Ok(())
+    }
+
+    // GHL magic poke timer callback
+    fn ghl_magic_poke(timer: &Timer) {
+        let driver = container_of!(timer, Self, ghl_poke_timer);
+        // Send magic data to GHL controller
+        let _ = driver.send_ghl_magic_data();
+    }
+}
+
+// USB driver implementation
+impl usb::Driver for XpadDriver {
+    fn disconnect(&self) {
+        if self.xtype == XType::Xbox360W {
+            self.xbox360w_stop_input();
+        }
+
+        self.deinit_input();
+        self.stop_output();
+        self.deinit_output();
+
+        if self.quirks.contains(QuirkFlags::GHL_XBOXONE) {
+            self.ghl_poke_timer.delete();
+        }
+    }
+
+    fn suspend(&self) -> Result<()> {
+        if self.xtype == XType::Xbox360W {
+            self.xbox360w_stop_input();
+            if AUTO_POWEROFF.load(Ordering::Relaxed) && self.pad_present {
+                self.poweroff_controller();
+            }
+        } else {
+            self.stop_input();
+        }
+
+        self.stop_output();
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<()> {
+        if self.xtype == XType::Xbox360W {
+            self.xbox360w_start_input()
+        } else {
+            self.start_input()
+        }
+    }
+}
+
+// Module initialization
+module_usb_driver! {
+    registration: XpadDriverRegistration,
+    params: [
+        ("dpad_to_buttons", DPAD_TO_BUTTONS),
+        ("triggers_to_buttons", TRIGGERS_TO_BUTTONS),
+        ("sticks_to_null", STICKS_TO_NULL),
+        ("auto_poweroff", AUTO_POWEROFF),
+    ],
 }
