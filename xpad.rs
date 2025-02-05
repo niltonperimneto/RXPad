@@ -1,7 +1,29 @@
+use input_linux::sys::{ff_effect, input_event, timeval};
+use input_linux::{
+    bitmask::BitmaskTrait, AbsoluteAxis, EventKind, ForceFeedbackKind, InputId, InputProperty, Key,
+    LedKind, MiscKind, RelativeAxis, SoundKind, SwitchKind,
+    use std::io::{Result, Write};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use usb::{Urb, UsbDevice, UsbError};
+use input::{InputDevice, InputEvent, AbsoluteAxis, Key, Button};
+use std::rc::Rc;
+use bitflags::bitflags;
+use kernel::{prelude::*, usb, input};
+use linux::input::{ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y};
+use linux::stat::{S_IRUGO, S_IWUSR};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+};
+
+module! {
+    type: VDev,
+    name: b"vdev",
+    license: b"GPL",
+}
+
 // Conditional compilation for debug
 #[cfg(debug_assertions)]
 const DEBUG: bool = true;
-
 // Linux constants module organization
 mod linux {
     // Input subsystem constants
@@ -12,17 +34,10 @@ mod linux {
     
     // Module parameter permissions
     pub mod stat {
-        pub const S_IRUGO: i32 = 0o400;  // Read permission for user/group/others
-        pub const S_IWUSR: i32 = 0o200;  // Write permission for user
+        pub const S_IRUGO: i32 = 0o400;  // Read permission for r/group/others
+        pub const S_IWUSR: i32 = 0o200;  // Write permission for r
     }
 }
-
-// Explicit imports for clarity
-use bitflags::bitflags;
-use kernel::{prelude::*, usb, input};
-use linux::input::{ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y};
-use linux::stat::{S_IRUGO, S_IWUSR};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // Network protocol constants
 const XPAD_PKT_LEN: usize = 64;
@@ -2732,7 +2747,6 @@ fn process_packet(dev: &mut InputDev, cmd: u16, data: &[u8]) -> Result<(), kerne
  * 01.1 - Pad state (Bytes 4+) valid
  *
  */
-use std::rc::Rc;
 
 struct XpadDriver {
     udev: usb::Device,
@@ -2768,10 +2782,6 @@ impl usb::Driver for XpadDriver {
         self.input_dev.unregister();
     }
 }
-
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use usb::{Urb, UsbDevice, UsbError};
-use input::{InputDevice, InputEvent, AbsoluteAxis, Key, Button};
 
 // Shared state structure
 struct UsbXpad {
