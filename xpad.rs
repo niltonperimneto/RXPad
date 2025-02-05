@@ -16,12 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 };
 
-module! {
-    type: VDev,
-    name: b"vdev",
-    license: b"GPL",
-}
-
 // Conditional compilation for debug
 #[cfg(debug_assertions)]
 const DEBUG: bool = true;
