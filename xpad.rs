@@ -2,10 +2,11 @@ use input_linux::sys::{ff_effect, input_event, timeval};
 use input_linux::{
     bitmask::BitmaskTrait, AbsoluteAxis, EventKind, ForceFeedbackKind, InputId, InputProperty, Key,
     LedKind, MiscKind, RelativeAxis, SoundKind, SwitchKind,
-    use std::io::{Result, Write};
+};
+use std::io::{Result, Write};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use usb::{Urb, UsbDevice, UsbError};
-use input::{InputDevice, InputEvent, AbsoluteAxis, Key, Button};
+use input::{InputDevice, InputEvent, Button};
 use std::rc::Rc;
 use bitflags::bitflags;
 use kernel::{prelude::*, usb, input};
